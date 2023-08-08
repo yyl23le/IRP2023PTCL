@@ -1,0 +1,70 @@
+#!/bin/bash
+
+#***************************************************************************************************************
+# Authors: Friday
+# Modified Date:15-06-2023 BST 00:00
+# Version: 1
+
+# To discover if there is any difference in the fragment length distributions between mutant and wild-type reads found overlapping the SNP variants, this script extract the read names supporting a particular allele at a particular variant site on the plus strand using the a predefined position and allele, and subsequently feed the text file into SAMtools and the resulting insert size metrics are collected by Picard.
+
+#***************************************************************************************************************
+
+# load required modules
+module load R
+module load samtools
+module load picard
+
+# Run R in terminal
+R
+
+# load library
+require(GenomicAlignments)
+
+# Set working directory
+setwd("/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam")
+
+mybam <- "/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_S3050_dD-RG-BQSR_FINAL.bam"
+## the variant to extract reads in chromosome:position
+varposition <- '10:90773947'
+## allele of variant
+var <- 'C'
+## convert to GRanges
+var.gr <- GRanges(varposition)
+
+
+## read BAM file
+aln <- readGAlignments(mybam,param=ScanBamParam(which=var.gr,what=c('qname','strand','seq')))
+## find variants at location! BASED ON THE plus strand
+aln.seq <- stackStringsFromGAlignments(aln,region=var.gr)
+## extract read names with variant
+reads <- mcols(aln[aln.seq == var])$qname
+
+print(reads)
+## save to file
+write(reads, "qnames_list.txt")
+
+# Exit R
+q()
+n
+
+#  The list of names were provided as argument to SAMtools view -N option to extract the corresponding reads
+samtools view -N qnames_list.txt -o /lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_FAS_ref.bam /lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_S3050_dD-RG-BQSR_FINAL.bam
+
+# Picard CollectInsertSizeMetrics was run on the resultant BAM files to generate insert size metrics
+module load picard/2.6.0
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    CollectInsertSizeMetrics \
+    I=/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_FAS_ref.bam \
+    O=/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_FAS_ref_insert_size_metrics.txt \
+    H=/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_FAS_ref_insert_size_metrics.pdf \
+    M=0.5
+
+#  Paired-end reads that do not have this expected default [FR] orientation will be considered chimeric, therefore we rerun the process with the reverse strand specificity.
+module load picard/2.6.0
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    CollectInsertSizeMetrics \
+    I=/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_FAS_ref.bam \
+    O=/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_FAS_ref_insert_size_metrics.txt \
+    H=/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_FAS_ref_insert_size_metrics.pdf \
+    M=0.5
+    EXPECTED_PAIR_ORIENTATIONS=RF
