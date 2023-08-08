@@ -17,3 +17,6 @@ Main Contributors of the project are:<br/>
 <p float="left">
   <img vertical-align=bottom src="https://github.com/yyl23le/IRP2023PTCL/blob/main/data_for_readme/CNA_ABC.png" width="500" height="500">
   <img vertical-align=bottom src="https://github.com/yyl23le/IRP2023PTCL/blob/main/data_for_readme/CNA_DE.png" width="500" height="350">
+
+![CNA](https://github.com/yyl23le/IRP2023PTCL/blob/main/data_for_readme/CNA_ABC.png?raw=true)
+![CNA](https://github.com/yyl23le/IRP2023PTCL/blob/main/data_for_readme/CNA_DE.png?raw=true)
