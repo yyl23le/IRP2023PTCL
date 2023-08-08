@@ -1,0 +1,195 @@
+#!/bin/bash
+
+#PBS -N cta
+#PBS -o stdout_cta.out
+#PBS -e stderr_cta.error
+#PBS -l walltime=48:00:00  # 29 hours for 14 BAMs
+#PBS -l vmem=64gb
+#PBS -l nodes=1:ppn=12
+#PBS -m bea
+#PBS -A (urUID)@student.le.ac.uk
+
+#***************************************************************************************************************
+# Authors: Christoper Simon Trethewey
+# Modified by:Friday
+# Modified Date:25-05-2023 BST 00:00
+# Version: 3.1
+
+# This alignment and pre-processing script aligns pair-ended reads to the UCSC hg38 genome and subsequently Collects read coverage across the genome, the insert size distribution and the corresponding matrix as well as the read counts in .hdf5 format for copy number analysis.  For references, the script estimate the insert sizes and seqeuncing depth.
+
+# Prior to running the script, please ensure the fq.gz files and a sample_list.txt file containing the accession number has been put inside the same $dataDir.
+
+# The file is designed to be submitted as a job to the PBS scheduler of a clustering enviornment operating, e.g. Alice and Dlal2.5. Alternatively hash the "set thread" command and replace ppn with the thread number deemed approapriate for your local machine taking into consideration of the total virtual memory available. cdmod 777 the script to set permission to run as a shell script locally.  The total number of processes shared on Linux can be view by:
+#cat /proc/sys/kernel/threads-max
+# If one decide to run the command-line programs on a local machine, please check the virtual memory limit and use to prevent the script from crashing using:
+#ulimit -a    or    #ulimit -v
+#free -hl
+#df -h
+# If process has been killed, one can check the previous progress using:
+#dmesg -T| grep -E -i -B5 'killed process'
+#***************************************************************************************************************
+
+# load required modules
+module load bwa/0.7.17 
+module load samtools/1.9
+module load picard/2.6.0
+module load gatk/4.1.5.0
+
+# load R as a number of the Picard Metrics tools invoke RExecutor, including CollectInsertSizeMetrics, CollectRnaSeqMetrics, and QualityScoreDistribution, to generate R code and graphics/PDFs; this makes r-base available to the picard docker image distributed and prevent java/Picard container from crashing with an IOExeption.
+module load R
+
+# load fastqc
+module load fastqc/0.11.5
+
+# Set thread
+export OMP_NUM_THREADS=$PBS_NUM_PPN
+
+# Get the system time
+now="$(date +"%c")"
+
+# set path variables
+IRPDIR="/lustre/alice3/scratch/spectre/y/yyl23/IRP_full_run"
+dataDir="/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir"
+
+# Create an input and ouput directories
+mkdir -p $IRPDIR/PROCESSED
+mkdir -p $IRPDIR/report
+mkdir -p $IRPDIR/finalBam
+mkdir -p $IRPDIR/CopyNumber
+mkdir -p $IRPDIR/fastqcoutput
+
+echo ----
+echo "Job started at $now"
+echo "current wd = $IRPDIR"
+
+
+# The following loop can be extended to include all the command-line programs
+for i in $(ls $dataDir/*.fq.gz | rev | cut -c 9- | rev | uniq)
+do 
+    echo "i = $i"
+    echo "file1 = ${i}_1.fq.gz"
+    echo "file2 = ${i}_2.fq.gz"
+
+    #j=$i; echo "j = $j"
+    #j=${j/$1}; echo "j = $j"
+done
+echo ----
+
+# Create a fasta index file using the faidx command in Samtools; the file describes byte offsets in the FASTA file for each contig, allowing us to compute exactly where to find a particular reference base at specific genomic coordinates in the FASTA file.  It has one record per line for each of the FASTA contigs; each record is of the contig (chromosome), size (Bp long), location, basesPerLine and bytesPerLine. 
+echo "Creating the fasta index file...(20secs)"
+samtools faidx $dataDir/Homo_sapiens_assembly38.fasta
+
+# Construct the FM-index for the reference genome using bwa index command.
+echo "constructing FM-index for the reference genome..."
+bwa index $dataDir/Homo_sapiens_assembly38.fasta
+
+# Create a FASTA sequence dictionary file - a SAM-style header file named ref.dict describing the contents of our FASTA file; it allows efficient random access to the reference bases.
+echo "Creating the FASTA sequence dictionary file...(30secs)"
+gatk CreateSequenceDictionary -R $dataDir/Homo_sapiens_assembly38.fasta
+
+# Index .vcf using the bundled tool IndexFeatureFile to allow for random access to enable queries by interval
+# Alternatively download respective vcf.idx from https://gatk.broadinstitute.org/hc/en-us/articles/360035890811-Resource-bundle
+echo "indexing bundle file..."
+gatk IndexFeatureFile --input $dataDir/Homo_sapiens_assembly38.dbsnp138.vcf
+
+echo ----
+
+while read prefix; do
+    # Using a shell loop in reading the list of accession number as the prefix argument into all the command-line programs
+
+    # Alignment of the pair-ended reads to the UCSC hg38 genome using Burrows-Wheeler Alignment Tool; it maps low-divergent sequences against a large reference genome;BWA-MEM algorithm is designed for longer sequences ranged from 70bp to 1Mbp snd high-quality queries as it is faster and more accurate; it also has better performance than BWA-backtrack for 70-100bp Illumina reads.
+    echo "aligning to UCSC-hg38..."
+    bwa mem -t $PBS_NUM_PPN -M $dataDir/Homo_sapiens_assembly38.fasta $dataDir/${prefix}_1.fq.gz $dataDir/${prefix}_2.fq.gz > $IRPDIR/${prefix}.sam;
+
+    echo "sorting and indexing..."
+    samtools view -bS $IRPDIR/${prefix}.sam | \
+    samtools sort -o $IRPDIR/PROCESSED/${prefix}_SI.bam -@ $PBS_NUM_PPN
+    samtools index $IRPDIR/PROCESSED/${prefix}_SI.bam
+
+    # Remove duplicate reads and updating the read groups; --TMP_DIR - One or more directories with space available to be used by this program for temporary storage of working files
+    # https://gatk.broadinstitute.org/hc/en-us/articles/360037052812-MarkDuplicates-Picard-
+    echo "removing duplicate reads..."
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    MarkDuplicates \
+    I=$IRPDIR/PROCESSED/${prefix}_SI.bam \
+    O=$IRPDIR/PROCESSED/${prefix}_dD.bam \
+    M=$IRPDIR/report/${prefix}_Picard_MarkDuplicates_metrics.txt \
+    CREATE_INDEX=true \
+    TMP_DIR=$IRPDIR/PROCESSED/${prefix}_TMP
+
+    echo "sorting and indexing..."
+    samtools sort $IRPDIR/PROCESSED/${prefix}_dD.bam -o $IRPDIR/PROCESSED/${prefix}_dD_SI.bam -@ $PBS_NUM_PPN
+    samtools index $IRPDIR/PROCESSED/${prefix}_dD_SI.bam
+
+    echo "updating read groups..."
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    AddOrReplaceReadGroups \
+    I=$IRPDIR/PROCESSED/${prefix}_dD_SI.bam \
+    O=$IRPDIR/PROCESSED/${prefix}_dD-RG.bam \
+    RGID=${prefix} \
+    RGLB=${prefix} \
+    RGPL=ILLUMINA \
+    RGPU=Novaseq_${prefix} \
+    RGSM=${prefix}
+
+    echo "sorting and indexing..."
+    samtools sort $IRPDIR/PROCESSED/${prefix}_dD-RG.bam -o $IRPDIR/PROCESSED/${prefix}_dD-RG_SI.bam -@ $PBS_NUM_PPN
+    samtools index $IRPDIR/PROCESSED/${prefix}_dD-RG_SI.bam
+
+    # Train linear basal quality recalibration model with the BaseRecalibrator tool
+    echo "generating BQSR table and recalibrate reads..."
+    gatk BaseRecalibrator \
+    -I $IRPDIR/PROCESSED/${prefix}_dD-RG_SI.bam \
+    --known-sites $dataDir/Homo_sapiens_assembly38.dbsnp138.vcf \
+    -O $IRPDIR/PROCESSED/${prefix}_BQSR.table \
+    -R $dataDir/Homo_sapiens_assembly38.fasta
+
+    # Apply the model
+    echo "applying BQSR..."
+    gatk ApplyBQSR \
+    -I $IRPDIR/PROCESSED/${prefix}_dD-RG_SI.bam \
+    -O $IRPDIR/PROCESSED/${prefix}_dD-RG-BQSR.bam \
+    -R $dataDir/Homo_sapiens_assembly38.fasta \
+    --bqsr-recal-file $IRPDIR/PROCESSED/${prefix}_BQSR.table
+
+    echo "final sort and index..."
+    samtools sort $IRPDIR/PROCESSED/${prefix}_dD-RG-BQSR.bam -o $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam -@ $PBS_NUM_PPN
+    samtools index $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam
+
+    # Downstream Analysis
+    echo "Collecting read coverage across the genome..."
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    CollectWgsMetrics \
+    I=$IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam \
+    O=$IRPDIR/${prefix}_collect_wgs_matrics.txt \
+    R=$dataDir/Homo_sapiens_assembly38.fasta
+    
+    echo "Collecting read counts for copynumber analysis...(3.5mins)"    
+    gatk CollectReadCounts \
+    -I $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam \
+    -L $dataDir/1000bin_WGS_grch38_intervals.interval_list \
+    --interval-merging-rule OVERLAPPING_ONLY \
+    -O $IRPDIR/CopyNumber/${prefix}.counts.hdf5
+
+    # Output the insert size distribution as both a histogram and as a data table; The CollectInsertSizeMetrics tool outputs the percentages of read pairs in each of the three orientations (FR, RF, and TANDEM) as a histogram. In addition, the insert size distribution is output as both a histogram (.insert_size_Histogram.pdf) and as a data table (.insert_size_metrics.txt). Note: Metrics labeled as percentages are actually expressed as fractions! https://broadinstitute.github.io/picard/picard-metric-definitions.html#InsertSizeMetrics
+    echo "Collecting insert size matrix...(4mins)"
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    CollectInsertSizeMetrics \
+    I=$IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam \
+    O=$IRPDIR/${prefix}_subset_insert_size_metrics.txt \
+    H=$IRPDIR/${prefix}_insert_size_histogram.pdf \
+    M=0.5
+
+    # Using samtools to list absolute value of the insert sizes (includes forward and reverse read as well as the unknown gap, inner mate distance, between them), one line per read, considering only the first pair of the properly mapped pair (flag -f66); the .txt file can be input into python or R to get the summary statistics and visualise the distubtion afterward. sqrt($0^2) ensures no negative values are returned, i.e. read mapped to the reverse strand. Limitations: estimated insert sizes from genome-mapped BAM files can be misleading becuase of aligner splitting and mapping sub-reads to exons. Consider determining the threshold to exclude very large inserts, using e.g. | awk '$0<1000'.
+    samtools view -f66 $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam | cut -f9 | awk '{print sqrt($0^2)}' > $IRPDIR/${prefix}_insert-sizes.txt;
+
+    # Calculate the average coverage for all the captured bases at all positions (including zero depth) where the BAM file was generated against (NR); most frequently between 0.4x and 1x for sWGS. The demoninator, NR, can be changed to the size of the genome; the size of the genome can be found using: samtools view -H *bamfile* | grep -P '^@SQ' | cut -f 3 -d ':' | awk '{sum+=$1} END {print sum}.
+    samtools depth -a $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam  |  awk '{sum+=$3; sumsq+=$3*$3} END { print "Average = ",sum/NR; print "Stdev = ",sqrt(sumsq/NR - (sum/NR)**2)}' > $IRPDIR/${prefix}_samtools_sequencing_depth_base_covered.txt;
+
+done <$dataDir/sample_list.txt
+
+# Run fastqc to screen for overrepresented sequences and generates the analysis output in a text file. * was used to parenthize glob-match to any fastq files.
+fastqc --threads $PBS_NUM_PPN --outdir="$IRPDIR/fastqcoutput" $dataDir/*.fq.gz
+
+echo ---- | echo "Job ended" 
+#mail -s "Insert size matrix calculation has been completed" (UID)@student.le.ac.uk

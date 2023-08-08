@@ -1,0 +1,57 @@
+#!/bin/bash
+
+#PBS -N cta_subset
+#PBS -o stdout_subset.out
+#PBS -e stderr_subset.error
+#PBS -l walltime=24:00:00
+#PBS -l vmem=32gb
+#PBS -l nodes=1:ppn=1
+#PBS -m bea
+#PBS -A (urUID)@student.le.ac.uk
+
+#***************************************************************************************************************
+# Authors: Friday
+# Modified Date: 30-05-2023 BST 00:00
+# Version: 1
+#***************************************************************************************************************
+
+# load required modules
+module load samtools/1.9
+
+# Get the system time
+now="$(date +"%c")"
+
+# set variable
+IRPDIR="/lustre/alice3/scratch/spectre/y/yyl23/IRP"
+dataDir="/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir"
+
+# Create an input and ouput directories
+mkdir -p $dataDir/filtered_BAM
+
+echo ----
+echo "Job started at $now"
+echo "current wd = $IRPDIR"
+
+while read prefix; do
+	echo "subsetting 50-100bp of the BAM file ${prefix}"
+	samtools view -h $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam | \
+  	awk 'substr($0,1,1)=="@" || ($9>= 50 && $9<= 100) || ($9<=-50 && $9>=-100)' | \
+  	samtools view -b > $dataDir/filtered_BAM/${prefix}_is-50-100.bam;
+
+	#echo "subsetting 100-150bp of the BAM file ${prefix}"
+	samtools view -h $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam | \
+  	awk 'substr($0,1,1)=="@" || ($9>= 100 && $9<= 150) || ($9<=-100 && $9>=-150)' | \
+  	samtools view -b > $dataDir/filtered_BAM/${prefix}_is-100-150.bam;
+
+	echo "subsetting 50-150bp of the BAM file ${prefix}"
+	samtools view -h $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam | \
+  	awk 'substr($0,1,1)=="@" || ($9>= 50 && $9<= 150) || ($9<=-50 && $9>=-150)' | \
+  	samtools view -b > $dataDir/filtered_BAM/${prefix}_is-50-150.bam;
+
+	samtools view -h $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam | \
+  	awk 'substr($0,1,1)=="@" || ($9>= 90 && $9<= 160) || ($9<=-90 && $9>=-160)' | \
+  	samtools view -b > $dataDir/filtered_BAM/${prefix}_is-90-160.bam;
+done <$dataDir/sample_list.txt
+
+echo ---- | echo "Job ended" 
+#mail -s "Insert size matrix calculation has been completed" (UID)@student.le.ac.uk
