@@ -1,0 +1,144 @@
+#!/bin/bash
+
+#PBS -N cta
+#PBS -o stdout_cta_merged.out  # took 12 hours for 5x2 pair-ended reads
+#PBS -e stderr_cta_merged.error
+#PBS -l walltime=24:00:00
+#PBS -l vmem=70gb
+#PBS -l nodes=1:ppn=12
+#PBS -m bea
+#PBS -A yyl23@student.le.ac.uk
+
+#***************************************************************************************************************
+# Authors: Christoper Simon Trethewey
+# Modified by:Friday
+# Modified Date:25-05-2023 BST 00:00
+# Version: 3.1
+
+# This alignment and pre-processing script aligns pair-ended reads to the UCSC hg38 genome and subsequently Collects read coverage across the genome, the insert size distribution and the corresponding matrix as well as the read counts in .hdf5 format for copy number analysis.  For references, the script estimate the insert sizes and seqeuncing depth.
+
+# Prior to running the script, please ensure the fq.gz files and a sample_list.txt file containing the accession number has been put inside the same $dataDir.
+
+# The file is designed to be submitted as a job to the PBS scheduler of a clustering enviornment operating, e.g. Alice and Dlal2.5. Alternatively hash the "set threat" command and replace ppn with the thread number deemed approapriate for your local machine taking into consideration of the total virtual memory available. cdmod 777 the script to set permission to run as a shell script locally.
+#***************************************************************************************************************
+
+# load required modules
+module load bwa/0.7.17 
+module load samtools/1.9
+module load picard/2.6.0
+module load gatk/4.1.5.0
+
+# load R as a number of the Picard Metrics tools invoke RExecutor, including CollectInsertSizeMetrics, CollectRnaSeqMetrics, and QualityScoreDistribution, to generate R code and graphics/PDFs; this makes r-base available to the picard docker image distributed and prevent java/Picard container from crashing with an IOExeption.
+module load R
+
+# Set thread
+export OMP_NUM_THREADS=$PBS_NUM_PPN
+
+# Get the system time
+now="$(date +"%c")"
+
+# set path variables
+IRPSAMDIR="/lustre/alice3/scratch/spectre/y/yyl23/IRP_full_run"
+IRPDIR="/lustre/alice3/scratch/spectre/y/yyl23/IRP_merged"
+dataDir="/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir"
+
+echo ----
+echo "Job started at $now"
+echo "current wd = $IRPDIR"
+echo ----
+
+while read prefix; do
+    echo "sorting and indexing..."
+    samtools view -bS $IRPSAMDIR/${prefix}.sam | \
+    samtools sort -o $IRPDIR/PROCESSED/${prefix}_SI.bam -@ $PBS_NUM_PPN
+    samtools index $IRPDIR/PROCESSED/${prefix}_SI.bam
+done <$dataDir/sample_list.txt
+
+while read prefix; do
+    # Merge BAM files generated from different lanes
+    echo "Make sure the read group info is assigned correctly to BAM headers. Merging lane files..."
+    samtools merge $IRPDIR/PROCESSED/${prefix}_SI.bam $IRPDIR/PROCESSED/${prefix}_L1_SI.bam $IRPDIR/PROCESSED/${prefix}_L2_SI.bam
+
+    # Remove duplicate reads and updating the read groups
+    echo "removing duplicate reads..."
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    MarkDuplicates \
+    I=$IRPDIR/PROCESSED/${prefix}_SI.bam \
+    O=$IRPDIR/PROCESSED/${prefix}_dD.bam \
+    M=$IRPDIR/report/${prefix}_Picard_MarkDuplicates_metrics.txt \
+    CREATE_INDEX=true \
+    TMP_DIR=$IRPDIR/PROCESSED/${prefix}_TMP
+
+    echo "sorting and indexing..."
+    samtools sort $IRPDIR/PROCESSED/${prefix}_dD.bam -o $IRPDIR/PROCESSED/${prefix}_dD_SI.bam -@ $PBS_NUM_PPN
+    samtools index $IRPDIR/PROCESSED/${prefix}_dD_SI.bam
+
+    echo "updating read groups..."
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    AddOrReplaceReadGroups \
+    I=$IRPDIR/PROCESSED/${prefix}_dD_SI.bam \
+    O=$IRPDIR/PROCESSED/${prefix}_dD-RG.bam \
+    ID=${prefix} \
+    LB=${prefix} \
+    PL=Illumina \
+    PU=Novaseq_${prefix} \
+    SM=${prefix}
+
+    echo "sorting and indexing..."
+    samtools sort $IRPDIR/PROCESSED/${prefix}_dD-RG.bam -o $IRPDIR/PROCESSED/${prefix}_dD-RG_SI.bam -@ $PBS_NUM_PPN
+    samtools index $IRPDIR/PROCESSED/${prefix}_dD-RG_SI.bam
+
+    # Train linear basal quality recalibration model with the BaseRecalibrator tool
+    echo "generating BQSR table and recalibrate reads..."
+    gatk BaseRecalibrator \
+    -I $IRPDIR/PROCESSED/${prefix}_dD-RG_SI.bam \
+    --known-sites $dataDir/Homo_sapiens_assembly38.dbsnp138.vcf \
+    -O $IRPDIR/PROCESSED/${prefix}_BQSR.table \
+    -R $dataDir/Homo_sapiens_assembly38.fasta \
+
+    # Apply the model
+    echo "applying BQSR..."
+    gatk ApplyBQSR \
+    -I $IRPDIR/PROCESSED/${prefix}_dD-RG_SI.bam \
+    -O $IRPDIR/PROCESSED/${prefix}_dD-RG-BQSR.bam \
+    -R $dataDir/Homo_sapiens_assembly38.fasta \
+    --bqsr-recal-file $IRPDIR/PROCESSED/${prefix}_BQSR.table
+
+    echo "final sort and index..."
+    samtools sort $IRPDIR/PROCESSED/${prefix}_dD-RG-BQSR.bam -o $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam -@ $PBS_NUM_PPN
+    samtools index $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam
+
+    # Downstream Analysis
+    echo "Collecting read coverage across the genome..."
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    CollectWgsMetrics \
+    I=$IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam \
+    O=$IRPDIR/${prefix}_collect_wgs_matrics.txt \
+    R=$dataDir/Homo_sapiens_assembly38.fasta
+    
+    echo "Collecting read counts for copynumber analysis...(3.5mins)"    
+    gatk CollectReadCounts \
+    -I $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam \
+    -L $dataDir/1000bin_WGS_grch38_intervals.interval_list \
+    --interval-merging-rule OVERLAPPING_ONLY \
+    -O $IRPDIR/CopyNumber/${prefix}.counts.hdf5
+
+    # Output the insert size distribution as both a histogram and as a data table 
+    echo "Collecting insert size matrix...(4mins)"
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    CollectInsertSizeMetrics \
+    I=$IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam \
+    O=$IRPDIR/${prefix}_subset_insert_size_metrics.txt \
+    H=$IRPDIR/${prefix}_insert_size_histogram.pdf \
+    M=0.5
+
+    # Using samtools to list abosulte value of the insert sizes (includes forward and reverse read as well as the unknown gap, inner mate distance, between them), one line per read, considering only the first pair of the properly mapped pair (flag -f66); the .txt file can be input into python or R to get the summary statistics and visualise the distubtion afterward. sqrt($0^2) ensures no negative values are returned, i.e. read mapped to the reverse strand. Limitations: estimated insert sizes from genome-mapped BAM files can be misleading becuase of aligner splitting and mapping sub-reads to exons. Consider determining the threshold to exclude very large inserts, using e.g. | awk '$0<1000'.
+    samtools view -f66 $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam | cut -f9 | awk '{print sqrt($0^2)}' > $IRPDIR/${prefix}_insert-sizes.txt;
+
+    # Calculate the average coverage for all the captured bases at all positions (including zero depth) where the BAM file was generated against (NR); most frequently between 0.4x and 1x for sWGS. The demoninator, NR, can be changed to the size of the genome; the size of the genome can be found using: samtools view -H *bamfile* | grep -P '^@SQ' | cut -f 3 -d ':' | awk '{sum+=$1} END {print sum}.
+    samtools depth -a $IRPDIR/finalBam/${prefix}_dD-RG-BQSR_FINAL.bam  |  awk '{sum+=$3; sumsq+=$3*$3} END { print "Average = ",sum/NR; print "Stdev = ",sqrt(sumsq/NR - (sum/NR)**2)}' > $IRPDIR/${prefix}_samtools_sequencing_depth_base_covered.txt;
+
+done <$dataDir/sample_list_merged.txt
+
+echo ---- | echo "Job ended" 
+#mail -s "Insert size matrix calculation has been completed" (UID)@student.le.ac.uk
