@@ -1,0 +1,80 @@
+#######################JAVA extract allele specific reads from bamfiles###################
+# The precompiled version can be found at https://uncloud.univ-nantes.fr/index.php/s/4sL77oWR2BFzSBH
+
+# Visualisation
+java -jar jvarkit.jar samjdk -f script.js CAB_S3050_dD-RG-BQSR_FINAL.bam -o CAB_S3050_FAS_ref.bam
+
+java -jar jvarkit.jar samjdk -f script_alt.js CAB_S3050_dD-RG-BQSR_FINAL.bam -o CAB_S3050_FAS_alt.bam
+
+
+
+return records.stream().anyMatch(R->R.getReadUnmappedFlag() == false && R.getContig()== contig && R.getEnd() >= mutpos&& R.getStart() <= mutpos && R.getReadBases()[R.getReadPositionAtReferencePosition(mutpos)]==mutbase);
+
+# reads your list of mutation and tries to affect the read to a SAM-ReadGroup (RG:Z).
+# http://lindenb.github.io/jvarkit/Biostar214299.html
+java -jar jvarkit.jar  biostar214299 -p position.tsv -R /lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/Somatic_variant_calling/GATK_hg19/Homo_sapiens_assembly19.fasta CAB_S3050_dD-RG-BQSR_FINAL.bam
+
+#########################################
+#########################################
+############## DOWNLOAD AND INSTALL BOOST ###############
+git clone --recursive https://github.com/boostorg/boost.git
+cd boost
+./bootstrap.sh --with-libraries=regex
+./b2
+############### DOWNLOAD VARIANT BAM ############### 
+git clone --recursive https://github.com/jwalabroad/VariantBam.git
+cd VariantBam
+
+############### COMPILE AND INSTALL (update Boost path) ###############
+./configure --with-boost=/alice-home/1/y/yyl23/boost
+make
+
+## get help
+/alice-home/1/y/yyl23/boost/VariantBam/src/variant --help
+
+# Extract only those reads supporting a particular allele at a variant site
+## make the motifs file (include reverse complements) 
+printf "G\nC" > /lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/motifs.txt
+## just look near the variant
+k="5:112,175,000-112,175,100" 
+r='motif[/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/motifs.txt]'
+g=5:112175079
+/alice-home/1/y/yyl23/boost/VariantBam/src/variant /lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_S3050_dD-RG-BQSR_FINAL.bam -k $k -g $g -r $r -o /lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_APC_reference.bam
+                                                                                                                                                                                                                                                         
+variant /lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_S3050_dD-RG-BQSR_FINAL.bam -k $k -g $g -r $r | cut -f1 | uniq > q.txt                                                                                                                                                                        
+printf "^@\n" >> q.txt                                                                                                                                                                                                                    
+samtools view /lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc/finalBam/CAB_S3050_dD-RG-BQSR_FINAL.bam $k -h | grep -f q.txt | samtools view - -b > CAB_APC_reference.bam
+
+#########################################
+#########################################
+
+
+sudo apt-get install autotools-dev build-essential libhts-dev libtool libpcre++-dev llvm-dev pkg-config uuid-dev zlib1g-dev
+
+conda install -c conda-forge ninja
+https://github.com/llvm/llvm-project/releases/tag/llvmorg-16.0.0
+cmake -S llvm -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# building from the git repository
+git clone --recursive https://github.com/samtools/htslib.git
+cd htslib
+# The configure script and config.h.in can be built by running:
+autoreconf -i
+# The './configure' command checks your build environment and allows various
+optional functionality to be enabled (see Configuration below)
+./configure
+
+# The 'make' command builds the HTSlib library and various useful
+utilities: bgzip, htsfile, and tabix.
+# The 'make install' command installs the libraries, library header files,
+utilities, several manual pages, and a pkgconfig file to /usr/local.
+make; make prefix=/home/yyl23/git install
+
+# building bamql from the git repository
+git clone --recursive https://github.com/BoutrosLaboratory/bamql.git
+cd bamql
+autoreconf -i && ./configure && make && sudo make install
+
+#########################################
+#########################################
