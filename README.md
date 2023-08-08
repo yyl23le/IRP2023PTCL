@@ -1,4 +1,4 @@
-# IRP2023_PTCL -  This is the main repository for:
+# IRP2023_PTCL
 Msc Bioinformatics IRP: Computational enrichment of ctDNA in peripheral T-cell lymphoma <br/> <br/>
 
 Greetings. This is my repository for the BS7130 Independent Research Project. <br/>
