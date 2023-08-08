@@ -1,0 +1,189 @@
+#!/bin/bash
+
+#PBS -N target_seq_old_sample
+#PBS -o stdout_target_old_sample.out
+#PBS -e stderr_target_old_sample.error
+#PBS -l walltime=24:00:00
+#PBS -l vmem=64gb
+#PBS -l nodes=1:ppn=4
+#PBS -m bea
+#PBS -A (urUID)@student.le.ac.uk
+
+#***************************************************************************************************************
+# Authors: Friday
+# Modified Date:15-06-2023 BST 00:00
+# Version: 1.0
+
+# This processing and Mutect2 analysis script aligns pair-ended reads to the GATK bundle hg19 genome and subsequently call somatic variant in the resulting BAM files.  For references, the script estimate the insert sizes and seqeuncing depth.  It will download most of the required reference files, and index them beforehand.  If it runs into errors, please ensure all feature files are indexed correctly, and the path to the files are correct.
+
+# Prior to running the script, please ensure the fq.gz files and a CNV_sample_list.txt file containing the accession number has been put inside the same $dataDir.  This script is designed to run as a portal shell script to Alice3. Please adjust accordingly if amending it to run locally.
+
+#***************************************************************************************************************
+
+# load required modules
+module load bwa/0.7.17 
+module load samtools/1.9
+module load picard/2.6.0
+module load gatk/4.1.5.0
+module load R
+module load vep/86
+module load tabix
+
+
+# Environment vairable: Sets the maximum number of threads to use for parallel region, unless overridden by omp_set_num_threads or num_threads.
+export OMP_NUM_THREADS=$PBS_NUM_PPN
+
+# Get the system time
+now="$(date +"%c")"
+
+# set path variables
+SVCDir="/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/Somatic_variant_calling"
+SVCDir="/lustre/alice3/scratch/spectre/y/yyl23/IRP/dataDir/local_svc"
+
+# Create a folder to retrieve and store hg19 GATK workflow resource bundle hosted on the Google Cloud buckets, including reference genome sequence, and the dbSNP release (build 138) in vcf. Available on https://console.cloud.google.com/storage/browser/gcp-public-data--broad-references/hg19/v0/
+mkdir -p $SVCDir/GATK_hg19
+cd $SVCDir/GATK_hg19
+
+# make a request against the GCS API endpoint; https://cloud.google.com/storage/docs/request-endpoints
+wget https://storage.googleapis.com/storage/v1/b/gcp-public-data--broad-references/o/hg19%2Fv0%2FHomo_sapiens_assembly19.fasta?alt=media
+wget https://storage.googleapis.com/storage/v1/b/gcp-public-data--broad-references/o/hg19%2Fv0%2FHomo_sapiens_assembly19.dbsnp138.vcf?alt=media
+wget https://storage.googleapis.com/storage/v1/b/gatk-best-practices/o/somatic-b37%2Faf-only-gnomad.raw.sites.vcf?alt=media
+
+# Create an input and ouput directories
+mkdir -p $SVCDir/PROCESSED
+mkdir -p $SVCDir/report
+mkdir -p $SVCDir/finalBam
+mkdir -p $SVCDir/CopyNumber
+mkdir -p $SVCDir/SAM
+mkdir -p $SVCDir/CALL
+mkdir -p $SVCDir/RPT
+
+echo ----
+echo "Job started at $now"
+echo ----
+Ts=$(cat $DataDir/CNV_sample_list.txt)
+echo "PATIENT IDS specified in SAMPLE LIST:"
+echo "$Ts"
+echo ----
+
+echo "Creating the fasta index file..."
+samtools faidx $SVCDir/GATK_hg19/Homo_sapiens_assembly19.fasta
+
+# Construct the FM-index for the reference genome using bwa index command.
+echo "constructing FM-index for the reference genome..."
+bwa index $SVCDir/GATK_hg19/Homo_sapiens_assembly19.fasta
+
+# Create a FASTA sequence dictionary file - a SAM-style header file named ref.dict describing the contents of our FASTA file; it allows efficient random access to the reference bases.
+echo "Creating the FASTA sequence dictionary file..."
+gatk CreateSequenceDictionary -R $SVCDir/GATK_hg19/Homo_sapiens_assembly19.fasta
+
+# Index .vcf using the bundled tool IndexFeatureFile to allow for random access to enable queries by interval
+echo "indexing bundle file..."
+gatk IndexFeatureFile --input=$SVCDir/GATK_hg19/Homo_sapiens_assembly19.dbsnp138.vcf
+gatk IndexFeatureFile --input=$SVCDir/OID46311_hg19_07aug2018_primary_targets_V2.bed
+
+# Using a shell loop in reading the list of accession number as the prefix argument into all the command-line programs
+while read prefix; do
+    tmp=$(echo "${prefix}" | awk -F '_' '{print $2"_"$1}')
+
+    # -R STR Complete read group header line. '\t' can be used in STR and will be converted to a TAB in the output SAM. The read group ID will be attached to every read in the output. An example is '@RG\tID:foo\tSM:bar'.
+    echo "aligning to hg19 reference build"
+    bwa mem -t $PBS_NUM_PPN -R '@RG\tID:foo\tPL:illumina\tLB:LaneX\tPU:NONE\tSM:bar' -M $DataDir/GATK_hg19/Homo_sapiens_assembly19.fasta $DataDir/${prefix}_1.fq.gz $DataDir/${prefix}_2.fq.gz > $SVCDir/SAM/${tmp}.sam;
+
+    echo "sorting and indexing..."
+    samtools view -bS $SVCDir/SAM/${tmp}.sam | \
+    samtools sort -o $SVCDir/PROCESSED/${tmp}_SI.bam -@ $PBS_NUM_PPN
+    samtools index $SVCDir/PROCESSED/${tmp}_SI.bam
+
+    # Remove duplicate reads and updating the read groups.  By default uses temporary storage. You will need to specify a temporary directory that has read/write access.
+    mkdir -p $SVCDir/PROCESSED/${tmp}_TMP
+    echo "Marking duplicate reads and sort..."
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    MarkDuplicates \
+    I=$SVCDir/PROCESSED/${tmp}_SI.bam \
+    O=$SVCDir/PROCESSED/${tmp}_dD.bam \
+    M=$SVCDir/report/${tmp}_Picard_MarkDuplicates_metrics.txt \
+    CREATE_INDEX=true \
+    TMP_DIR=$SVCDir/PROCESSED/${tmp}_TMP
+
+    echo "sorting and indexing..."
+    samtools sort $SVCDir/PROCESSED/${tmp}_dD.bam -o $SVCDir/PROCESSED/${tmp}_dD_SI.bam -@ $PBS_NUM_PPN
+    samtools index $SVCDir/PROCESSED/${tmp}_dD_SI.bam
+
+    echo "updating read groups..."
+    java -Xms128m -Xmx1024m -jar /cm/shared/apps/picard/2.6.0/picard.jar \
+    AddOrReplaceReadGroups \
+    I=$SVCDir/PROCESSED/${tmp}_dD_SI.bam \
+    O=$SVCDir/PROCESSED/${tmp}_dD-RG.bam \
+    ID=${tmp} \
+    LB=${tmp} \
+    PL=Illumina \
+    PU=Novaseq_${tmp} \
+    SM=${tmp}
+
+    echo "sorting and indexing..."
+    samtools sort $SVCDir/PROCESSED/${tmp}_dD-RG.bam -o $SVCDir/PROCESSED/${tmp}_dD-RG_SI.bam -@ $PBS_NUM_PPN
+    samtools index $SVCDir/PROCESSED/${tmp}_dD-RG_SI.bam
+
+    # Train linear basal quality recalibration model with the BaseRecalibrator tool
+    echo "generating BQSR table and recalibrate reads..."
+    gatk BaseRecalibrator \
+    -I $SVCDir/PROCESSED/${tmp}_dD-RG_SI.bam \
+    --known-sites $SVCDir/GATK_hg19/Homo_sapiens_assembly19.dbsnp138.vcf \
+    -O $SVCDir/PROCESSED/${tmp}_BQSR.table \
+    -R $SVCDir/GATK_hg19/Homo_sapiens_assembly19.fasta
+
+    echo "applying BQSR..."
+    gatk ApplyBQSR \
+    -I $SVCDir/PROCESSED/${tmp}_dD-RG_SI.bam \
+    -O $SVCDir/PROCESSED/${tmp}_dD-RG-BQSR.bam \
+    -R $SVCDir/GATK_hg19/Homo_sapiens_assembly19.fasta \
+    --bqsr-recal-file $SVCDir/PROCESSED/${tmp}_BQSR.table
+
+    echo "final sort and index..."
+    samtools sort $SVCDir/PROCESSED/${tmp}_dD-RG-BQSR.bam -o $SVCDir/finalBam/${tmp}_dD-RG-BQSR_FINAL.bam -@ $PBS_NUM_PPN
+    samtools index $SVCDir/finalBam/${tmp}_dD-RG-BQSR_FINAL.bam
+
+    ## Somatic variant discovery pipline (SNVs and indels)
+    # The tool skips emitting variants that are clearly present in the population germline, and focuses on the remaining regions showing signs of somatic variation.  It then discards the existing mapping information, and completely reassembles the reads in that region, which may result in a variable end variant allele frequency (VAF).  The reads are aligned to each candidate variant haplotypes via the Pair-HMM algorithm to obtain a matrix of likelihoods, and a Bayesian somatic likelihoods model is applied to obtain the log-odds for alleles to be somatic variants in contrast to sequencing artefacts.
+    echo "Mutect2..."
+    gatk Mutect2 \
+    --reference $DataDir/GATK_hg19/Homo_sapiens_assembly19.fasta \
+    --intervals $DataDir/OID46311_hg19_07aug2018_primary_targets_V2.bed \
+    --disable-read-filter MateOnSameContigOrNoMappedMateReadFilter \
+    --germline-resource $DataDir/GATK_hg19/af-only-gnomad.raw.sites.vcf \
+    -I $SVCDir/finalBam/${tmp}_dD-RG-BQSR_FINAL.bam \
+    -O $SVCDir/CALL/${tmp}.mutect2.vcf.gz
+
+    # Filter using default settings.  Read errors were assumed to be independent.
+    echo 'filtering mutect calls for sample...'
+    gatk FilterMutectCalls \
+    -V $SVCDir/CALL/${tmp}.mutect2.vcf.gz \
+    -O $SVCDir/CALL/${tmp}.mutect2_filtered.vcf.gz \
+    -R $DataDir/GATK_hg19/Homo_sapiens_assembly19.fasta
+
+    # To predict fractional contamination
+    gatk CalculateContamination \
+    -I $SVCDir/RPT/${tmp}_pileupsummaries.table \
+    -O $SVCDir/RPT/${tmp}_GATKcontamination_calc.table
+
+    gunzip $SVCDir/CALL/${tmp}.mutect2_filtered.vcf.gz
+
+    echo "annotating with maftools..."
+    perl $DataDir/vcf2maf.pl \
+    --input-vcf $SVCDir/CALL/${tmp}.mutect2_filtered.vcf \
+    --ref-fasta $DataDir/GATK_hg19/Homo_sapiens_assembly19.fasta \
+    --vep-forks 16 \
+    --vep-path /cm/shared/apps/vep/86 \
+    --vep-data /cm/shared/apps/vep/86/data \
+    --filter-vcf $DataDir/ExAC.r0.3.sites.vep.hg19.vcf.gz \
+    --buffer-size 100 \
+    --vcf-tumor-id ${tmp} \
+    --tumor-id ${tmp} \
+    --output-maf $SVCDir/CALL/${tmp}_mutect2.maf
+
+    # for carrying over to excel for filtering
+    cp $SVCDir/CALL/${tmp}_mutect2.maf $SVCDir/CALL/${tmp}_mutect2.txt
+done < $DataDir/CNV_sample_list.txt
+
+echo ---- | echo "Job ended" 
