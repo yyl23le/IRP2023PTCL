@@ -1,0 +1,13 @@
+final String contig= "10";
+final int mutpos = 90773947;
+final char mutbase='C';
+if(record.getReadUnmappedFlag()) return false;
+if(!record.getContig().equals(contig)) return false;
+if(record.getEnd() < mutpos) return false;
+if(record.getStart() > mutpos) return false;
+int readpos = record.getReadPositionAtReferencePosition(mutpos);
+if(readpos<1) return false;
+readpos--;
+final byte[]    bases= record.getReadBases();
+if(bases[readpos]==mutbase) return true;
+return false;
