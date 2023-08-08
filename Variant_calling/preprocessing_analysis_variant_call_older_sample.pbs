@@ -89,7 +89,13 @@ while read prefix; do
     # -R STR Complete read group header line. '\t' can be used in STR and will be converted to a TAB in the output SAM. The read group ID will be attached to every read in the output. An example is '@RG\tID:foo\tSM:bar'.
     echo "aligning to hg19 reference build"
     bwa mem -t $PBS_NUM_PPN -R '@RG\tID:foo\tPL:illumina\tLB:LaneX\tPU:NONE\tSM:bar' -M $DataDir/GATK_hg19/Homo_sapiens_assembly19.fasta $DataDir/${prefix}_1.fq.gz $DataDir/${prefix}_2.fq.gz > $SVCDir/SAM/${tmp}.sam;
+done < $DataDir/CNV_sample_list.txt
 
+while read prefix; do
+    samtools merge $SVCDir/PROCESSED/${tmp}_SI.bam $SVCDir/PROCESSED/${prefix}-1a_HMYYNDSX2_L2_SI.bam $SVCDir/PROCESSED/${prefix}-1a_HNKJMDSX2_L4_SI.bam
+done < $SVCDir/CNV_sample_list_combi.txt
+
+while read prefix; do
     echo "sorting and indexing..."
     samtools view -bS $SVCDir/SAM/${tmp}.sam | \
     samtools sort -o $SVCDir/PROCESSED/${tmp}_SI.bam -@ $PBS_NUM_PPN
@@ -184,6 +190,6 @@ while read prefix; do
 
     # for carrying over to excel for filtering
     cp $SVCDir/CALL/${tmp}_mutect2.maf $SVCDir/CALL/${tmp}_mutect2.txt
-done < $DataDir/CNV_sample_list.txt
+done < $DataDir/CNV_sample_list_2.txt
 
 echo ---- | echo "Job ended" 
